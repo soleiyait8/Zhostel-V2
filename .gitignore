@@ -1,0 +1,9 @@
+.env
+deploy/.env
+deploy/backups/
+frontend/node_modules/
+frontend/.next/
+frontend/next-env.d.ts
+frontend/tsconfig.tsbuildinfo
+backend/bin/
+*.dump

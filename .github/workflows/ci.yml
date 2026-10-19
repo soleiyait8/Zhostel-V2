@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.6-alpine
+        env:
+          POSTGRES_USER: adms
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: adms_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U adms -d adms_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      ADMS_TEST_DATABASE_URL: postgres://adms:ci-only-password@localhost:5432/adms_test?sslmode=disable
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: backend/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - name: Tests (unit + integration against PostgreSQL)
+        run: go test -p 1 -count=1 ./...
+      - run: go build ./cmd/...
+
+  frontend:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx tsc --noEmit
+      - run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+
+  deploy-config:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose file
+        working-directory: deploy
+        run: cp .env.example .env && docker compose config --quiet
+      - name: Validate Caddyfile
+        run: >
+          docker run --rm -v "$PWD/deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro"
+          -e APP_DOMAIN=app.example.com -e ADMS_DOMAIN=adms.example.com -e ACME_EMAIL=ci@example.com
+          caddy:2.8.4-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Shell scripts
+        run: for f in deploy/scripts/*.sh; do bash -n "$f"; done

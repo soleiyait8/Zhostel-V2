@@ -1,0 +1,634 @@
+openapi: 3.1.0
+info:
+  title: ADMS application API
+  version: 0.4.0
+  description: |
+    Authenticated API behind the HR dashboard. Device protocol routes (`/iclock/*`)
+    are a separate service and are not part of this API.
+
+    **Authentication.** `POST /api/auth/login` sets an HttpOnly `adms_session` cookie.
+    **CSRF.** Every request other than GET must send `X-ADMS-CSRF: 1`.
+    **Roles.** `viewer` < `hr` < `admin`. Each operation lists the minimum role.
+    **Errors.** `{"error": {"code": "...", "message": "...", "fields": {...}}}`; `fields` appears on 422 validation errors.
+    **Times.** Instants are RFC 3339 in UTC. Date filters are interpreted in the business timezone (Asia/Manila by default).
+servers:
+  - url: https://attendance.example.com
+security:
+  - session: []
+tags:
+  - name: Auth
+  - name: Users
+  - name: Departments
+  - name: Employees
+  - name: Mappings
+  - name: Devices
+  - name: Attendance records
+  - name: Monitoring
+
+paths:
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Sign in
+      security: []
+      description: Limited to 10 attempts per IP per 15 minutes. Failures are audited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              additionalProperties: false
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200": { description: Signed in; session cookie set, content: { application/json: { schema: { $ref: "#/components/schemas/Me" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Sign out (viewer)
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      responses: { "204": { description: Signed out } }
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user (viewer)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Me" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+  /api/auth/password:
+    post:
+      tags: [Auth]
+      summary: Change own password (viewer)
+      description: Ends every session of the user, including the current one.
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 12 }
+      responses:
+        "204": { description: Changed }
+        "401": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+
+  /api/users:
+    get:
+      tags: [Users]
+      summary: List users (admin)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: "#/components/schemas/User" } } } } } } }
+    post:
+      tags: [Users]
+      summary: Create a user (admin)
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, role, password]
+              properties:
+                name: { type: string, maxLength: 100 }
+                email: { type: string, format: email }
+                role: { $ref: "#/components/schemas/Role" }
+                password: { type: string, minLength: 12 }
+      responses:
+        "201": { $ref: "#/components/responses/Created" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /api/users/{id}:
+    put:
+      tags: [Users]
+      summary: Update name, role or access (admin)
+      description: Administrators cannot deactivate or demote themselves. Role or access changes end the user's sessions.
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                role: { $ref: "#/components/schemas/Role" }
+                active: { type: boolean }
+      responses:
+        "200": { description: Updated, content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "422": { $ref: "#/components/responses/Error" }
+
+  /api/departments:
+    get:
+      tags: [Departments]
+      summary: List departments (viewer)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: "#/components/schemas/Department" } } } } } } }
+    post:
+      tags: [Departments]
+      summary: Create a department (hr)
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody: { $ref: "#/components/requestBodies/Department" }
+      responses:
+        "201": { $ref: "#/components/responses/Created" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /api/departments/{id}:
+    put:
+      tags: [Departments]
+      summary: Update a department (hr)
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Csrf" }]
+      requestBody: { $ref: "#/components/requestBodies/Department" }
+      responses:
+        "204": { description: Updated }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /api/employees:
+    get:
+      tags: [Employees]
+      summary: List and search employees (viewer)
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: Matches name or employee number }
+        - { name: department_id, in: query, schema: { type: string, format: uuid } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/EmploymentStatus" } }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Offset" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Employee" } }
+                  total: { type: integer }
+                  limit: { type: integer }
+                  offset: { type: integer }
+    post:
+      tags: [Employees]
+      summary: Create an employee (hr)
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody: { $ref: "#/components/requestBodies/Employee" }
+      responses:
+        "201": { $ref: "#/components/responses/Created" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /api/employees/export.csv:
+    get:
+      tags: [Employees]
+      summary: Export employees as CSV (viewer)
+      description: Cells beginning with = + - @ are prefixed with an apostrophe to prevent formula injection.
+      responses:
+        "200": { description: CSV file, content: { text/csv: { schema: { type: string } } } }
+  /api/employees/import:
+    post:
+      tags: [Employees]
+      summary: Import employees from CSV (hr)
+      description: |
+        Upserts by `employee_number`. Required columns: employee_number, first_name, last_name.
+        Optional: department (existing name), position, employment_status, hire_date (YYYY-MM-DD).
+        The whole file is one transaction; any row error saves nothing.
+      parameters:
+        - { $ref: "#/components/parameters/Csrf" }
+        - { name: dry_run, in: query, schema: { type: boolean }, description: Validate only }
+      requestBody:
+        required: true
+        content: { text/csv: { schema: { type: string } } }
+      responses:
+        "200": { description: Validated or saved, content: { application/json: { schema: { $ref: "#/components/schemas/ImportResult" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "422": { description: One or more rows invalid; nothing saved, content: { application/json: { schema: { $ref: "#/components/schemas/ImportResult" } } } }
+  /api/employees/{id}:
+    get:
+      tags: [Employees]
+      summary: Get an employee (viewer)
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Employee" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [Employees]
+      summary: Update an employee (hr)
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Csrf" }]
+      requestBody: { $ref: "#/components/requestBodies/Employee" }
+      responses:
+        "204": { description: Updated }
+        "422": { $ref: "#/components/responses/Error" }
+  /api/employees/{id}/deactivate:
+    post:
+      tags: [Employees]
+      summary: Deactivate an employee (hr)
+      description: Sets status to inactive (default) or separated and ends current device mappings. History is kept.
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                employment_status: { type: string, enum: [inactive, separated] }
+      responses:
+        "200": { description: Deactivated, content: { application/json: { schema: { type: object, properties: { mappings_closed: { type: integer } } } } } }
+
+  /api/employees/{id}/mappings:
+    get:
+      tags: [Mappings]
+      summary: Device user ID mappings for an employee, current and past (viewer)
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: "#/components/schemas/Mapping" } } } } } } }
+    post:
+      tags: [Mappings]
+      summary: Map a device user ID to this employee (hr)
+      description: Fails with 409 if the ID is mapped to anyone for an overlapping period.
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id, device_user_id]
+              properties:
+                device_id: { type: string, format: uuid }
+                device_user_id: { type: string, pattern: "^[A-Za-z0-9]{1,24}$" }
+                valid_from: { type: string, format: date-time, description: Defaults to now }
+      responses:
+        "201": { $ref: "#/components/responses/Created" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /api/mappings/{id}/end:
+    post:
+      tags: [Mappings]
+      summary: End a current mapping (hr)
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Csrf" }]
+      responses:
+        "200": { description: Ended, content: { application/json: { schema: { type: object, properties: { valid_until: { type: string, format: date-time } } } } } }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /api/devices:
+    get:
+      tags: [Devices]
+      summary: List devices with live status (viewer)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { items: { type: array, items: { $ref: "#/components/schemas/Device" } } } } } } }
+    post:
+      tags: [Devices]
+      summary: Register a device (admin)
+      description: Also resolves open "unknown device" alerts for the same serial.
+      parameters: [{ $ref: "#/components/parameters/Csrf" }]
+      requestBody: { $ref: "#/components/requestBodies/Device" }
+      responses:
+        "201": { $ref: "#/components/responses/Created" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /api/devices/setup-info:
+    get:
+      tags: [Devices]
+      summary: Server address and port that terminals should be configured with (viewer)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/SetupInfo" } } } }
+  /api/devices/{id}:
+    get:
+      tags: [Devices]
+      summary: Get a device (viewer)
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Device" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [Devices]
+      summary: Update device settings (admin)
+      description: The serial number cannot be changed; register a new device instead.
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Csrf" }]
+      requestBody: { $ref: "#/components/requestBodies/Device" }
+      responses:
+        "204": { description: Updated }
+        "422": { $ref: "#/components/responses/Error" }
+  /api/devices/{id}/status:
+    get:
+      tags: [Devices]
+      summary: Device health, last transaction and 24-hour traffic summary (viewer)
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device: { $ref: "#/components/schemas/Device" }
+                  outcomes_24h: { type: object, additionalProperties: { type: integer } }
+                  last_transaction:
+                    type: [object, "null"]
+                    properties:
+                      device_user_id: { type: string }
+                      punch_at: { type: string, format: date-time }
+                      received_at: { type: string, format: date-time }
+  /api/devices/{id}/communications:
+    get:
+      tags: [Devices]
+      summary: Recent device requests and replies, biometric data redacted (hr)
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Limit" }, { $ref: "#/components/parameters/Offset" }]
+      responses:
+        "200": { description: OK }
+  /api/devices/{id}/users:
+    get:
+      tags: [Devices]
+      summary: User IDs known for a device with their current employee (viewer)
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: OK }
+  /api/devices/{id}/reprocess:
+    post:
+      tags: [Devices]
+      summary: Re-evaluate held records for a device (admin)
+      description: Original payloads are never modified. `accept_future` also accepts punches dated in the future.
+      parameters: [{ $ref: "#/components/parameters/Id" }, { $ref: "#/components/parameters/Csrf" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids: { type: array, items: { type: string, format: uuid }, description: Limit to these records }
+                accept_future: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  examined: { type: integer }
+                  accepted: { type: integer }
+                  still_rejected: { type: integer }
+  /api/devices/{id}/reachability:
+    get:
+      tags: [Devices]
+      summary: Check the server side of the device path (viewer)
+      description: Reports whether the ADMS service is running and when the device was last heard from. It cannot test the device's own network.
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: OK }
+
+  /api/punches:
+    get:
+      tags: [Attendance records]
+      summary: Raw punch records with the employee mapped at punch time (viewer)
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date }, description: Defaults to today }
+        - { name: to, in: query, schema: { type: string, format: date }, description: Inclusive; range at most 93 days }
+        - { name: device_id, in: query, schema: { type: string, format: uuid } }
+        - { name: employee_id, in: query, schema: { type: string, format: uuid } }
+        - { name: department_id, in: query, schema: { type: string, format: uuid } }
+        - { name: device_user_id, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [accepted, rejected, unmatched] } }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Offset" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Punch" } }
+                  total: { type: integer }
+                  timezone: { type: string }
+        "422": { $ref: "#/components/responses/Error" }
+  /api/unmatched-users:
+    get:
+      tags: [Attendance records]
+      summary: Device user IDs with punches but no employee mapping, last 62 days (viewer)
+      responses: { "200": { description: OK } }
+
+  /api/dashboard:
+    get:
+      tags: [Monitoring]
+      summary: Today's figures, device health and open problems (viewer)
+      description: late_arrivals, missing_punches and overtime_minutes are null until the attendance engine (Phase 3) is enabled.
+      responses: { "200": { description: OK } }
+  /api/sync-errors:
+    get:
+      tags: [Monitoring]
+      summary: Device and ingestion problems (viewer)
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [open, all], default: open } }
+        - { name: device_id, in: query, schema: { type: string, format: uuid } }
+        - { $ref: "#/components/parameters/Limit" }
+      responses: { "200": { description: OK } }
+  /api/sync-errors/{id}/resolve:
+    post:
+      tags: [Monitoring]
+      summary: Mark a problem resolved (hr)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+        - { $ref: "#/components/parameters/Csrf" }
+      responses:
+        "204": { description: Resolved }
+        "404": { $ref: "#/components/responses/Error" }
+  /api/audit-logs:
+    get:
+      tags: [Monitoring]
+      summary: Audit trail, newest first (hr)
+      parameters:
+        - { name: entity_type, in: query, schema: { type: string } }
+        - { name: entity_id, in: query, schema: { type: string } }
+        - { name: actor_user_id, in: query, schema: { type: string, format: uuid } }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Offset" }
+      responses: { "200": { description: OK } }
+
+components:
+  securitySchemes:
+    session: { type: apiKey, in: cookie, name: adms_session }
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    Csrf: { name: X-ADMS-CSRF, in: header, required: true, schema: { type: string, const: "1" } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1 } }
+    Offset: { name: offset, in: query, schema: { type: integer, minimum: 0 } }
+  responses:
+    Created:
+      description: Created
+      content: { application/json: { schema: { type: object, properties: { id: { type: string, format: uuid } } } } }
+    Error:
+      description: Error
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  requestBodies:
+    Department:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name]
+            properties:
+              name: { type: string, maxLength: 100 }
+              description: { type: string, maxLength: 500 }
+              active: { type: boolean }
+    Employee:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [employee_number, first_name, last_name]
+            properties:
+              employee_number: { type: string, pattern: "^[A-Za-z0-9-]{1,32}$" }
+              first_name: { type: string, maxLength: 100 }
+              last_name: { type: string, maxLength: 100 }
+              department_id: { type: [string, "null"], format: uuid }
+              position: { type: string, maxLength: 100 }
+              employment_status: { $ref: "#/components/schemas/EmploymentStatus" }
+              hire_date: { type: [string, "null"], format: date }
+    Device:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [device_name]
+            properties:
+              device_name: { type: string, maxLength: 100 }
+              serial_number: { type: string, pattern: "^[A-Za-z0-9_-]{4,32}$", description: Required on create; ignored on update }
+              model: { type: string, default: MB10-VL }
+              location: { type: string }
+              timezone: { type: string, default: Asia/Manila, description: IANA timezone of the device clock }
+              allowed_cidrs: { type: array, items: { type: string }, description: IPs or CIDR ranges; empty allows any }
+              enabled: { type: boolean }
+  schemas:
+    Role: { type: string, enum: [admin, hr, viewer] }
+    EmploymentStatus: { type: string, enum: [active, on_leave, inactive, separated] }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            fields: { type: object, additionalProperties: { type: string } }
+    Me:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        active: { type: boolean }
+        last_login_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+    Department:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        active: { type: boolean }
+        employee_count: { type: integer }
+    Employee:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        employee_number: { type: string }
+        first_name: { type: string }
+        last_name: { type: string }
+        department_id: { type: [string, "null"], format: uuid }
+        department_name: { type: [string, "null"] }
+        position: { type: string }
+        employment_status: { $ref: "#/components/schemas/EmploymentStatus" }
+        hire_date: { type: [string, "null"], format: date }
+        device_user_ids: { type: array, items: { type: string }, description: Currently mapped IDs }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Mapping:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        employee_id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid }
+        device_name: { type: string }
+        device_user_id: { type: string }
+        valid_from: { type: string, format: date-time }
+        valid_until: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+    Device:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        device_name: { type: string }
+        serial_number: { type: string }
+        model: { type: string }
+        firmware_version: { type: [string, "null"] }
+        push_version: { type: [string, "null"] }
+        location: { type: string }
+        timezone: { type: string }
+        allowed_cidrs: { type: array, items: { type: string } }
+        enabled: { type: boolean }
+        status: { type: string, enum: [online, offline, never_connected, disabled] }
+        last_seen_at: { type: [string, "null"], format: date-time }
+        last_ip: { type: [string, "null"] }
+        last_transaction_at: { type: [string, "null"], format: date-time }
+        punches_today: { type: integer }
+        open_errors: { type: integer }
+        created_at: { type: string, format: date-time }
+    SetupInfo:
+      type: object
+      properties:
+        server_address: { type: string }
+        server_port: { type: integer }
+        https: { type: boolean }
+        endpoint: { type: string }
+    Punch:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        device_id: { type: [string, "null"], format: uuid }
+        device_name: { type: [string, "null"] }
+        device_user_id: { type: [string, "null"] }
+        device_timestamp: { type: [string, "null"], description: Device wall-clock time exactly as sent }
+        punch_at: { type: [string, "null"], format: date-time }
+        received_at: { type: string, format: date-time }
+        event_type: { type: [string, "null"], description: Raw status code from the device }
+        verification_method: { type: [string, "null"], description: Raw verify code from the device }
+        work_code: { type: [string, "null"] }
+        parse_status: { type: string, enum: [accepted, rejected] }
+        rejection_reason: { type: [string, "null"] }
+        original_payload: { type: string }
+        employee_id: { type: [string, "null"], format: uuid }
+        employee_number: { type: [string, "null"] }
+        employee_name: { type: [string, "null"] }
+    ImportResult:
+      type: object
+      properties:
+        saved: { type: boolean }
+        rows:
+          type: array
+          items:
+            type: object
+            properties:
+              line: { type: integer }
+              employee_number: { type: string }
+              action: { type: string, enum: [created, updated, error] }
+              error: { type: string }

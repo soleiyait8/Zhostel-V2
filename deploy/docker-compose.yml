@@ -1,0 +1,163 @@
+# ADMS production stack. Run from this directory:
+#   cp .env.example .env   (then fill it in)
+#   docker compose up -d --build
+#
+# Only Caddy publishes ports (80/443). PostgreSQL is on an internal network
+# with no route to the internet. Port 4370 (ZK pull SDK) is never exposed.
+
+name: adms
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+x-db-env: &db-env
+  DATABASE_URL: postgres://${POSTGRES_USER:-adms}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-adms}?sslmode=disable
+
+services:
+  postgres:
+    image: postgres:16.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-adms}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-adms}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      TZ: UTC
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    shm_size: 256m
+    logging: *logging
+
+  # One-shot: applies migrations, then exits. api and adms wait for it.
+  migrate:
+    build: ../backend
+    image: adms-backend:local
+    command: ["/usr/local/bin/migrate"]
+    environment: *db-env
+    networks: [data]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+    <<: *hardening
+    logging: *logging
+
+  adms:
+    image: adms-backend:local
+    command: ["/usr/local/bin/adms"]
+    restart: unless-stopped
+    environment:
+      <<: *db-env
+      ADMS_ADDR: ":8081"
+      TRUST_PROXY: "true"
+      ADMS_PROFILE_NAME: ${ADMS_PROFILE_NAME:-zk-push-generic}
+      ADMS_PROFILE_VERIFIED: ${ADMS_PROFILE_VERIFIED:-false}
+      ADMS_ACK_STYLE: ${ADMS_ACK_STYLE:-ok}
+      ADMS_LINE_ENDING: ${ADMS_LINE_ENDING:-lf}
+      ADMS_TRANS_FLAG: ${ADMS_TRANS_FLAG:-1111000000}
+      ADMS_DEVICE_TZ_HOURS: ${ADMS_DEVICE_TZ_HOURS:-8}
+      ADMS_EXTRA_OPTIONS: ${ADMS_EXTRA_OPTIONS:-}
+      ADMS_ENABLE_COMMANDS: ${ADMS_ENABLE_COMMANDS:-false}
+      ADMS_LOG_HEARTBEATS: ${ADMS_LOG_HEARTBEATS:-false}
+      ADMS_COMM_LOG_RETENTION_DAYS: ${ADMS_COMM_LOG_RETENTION_DAYS:-30}
+      ADMS_RATE_LIMIT_PER_MIN: ${ADMS_RATE_LIMIT_PER_MIN:-300}
+    networks: [edge, data]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    <<: *hardening
+    logging: *logging
+
+  api:
+    image: adms-backend:local
+    command: ["/usr/local/bin/api"]
+    restart: unless-stopped
+    environment:
+      <<: *db-env
+      API_ADDR: ":8080"
+      TRUST_PROXY: "true"
+      COOKIE_SECURE: "true"
+      SESSION_TTL: ${SESSION_TTL:-12h}
+      ADMS_INTERNAL_URL: http://adms:8081
+      ADMS_PUBLIC_HOST: ${ADMS_DOMAIN:?set ADMS_DOMAIN in .env}
+      ADMS_PUBLIC_PORT: ${ADMS_PUBLIC_PORT:-443}
+      ADMS_PUBLIC_HTTPS: ${ADMS_PUBLIC_HTTPS:-true}
+    networks: [edge, data]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    <<: *hardening
+    logging: *logging
+
+  frontend:
+    build: ../frontend
+    image: adms-frontend:local
+    restart: unless-stopped
+    environment:
+      API_INTERNAL_URL: http://api:8080
+    networks: [edge]
+    depends_on:
+      api: { condition: service_healthy }
+    read_only: true
+    tmpfs: ["/tmp", "/app/.next/cache"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+
+  caddy:
+    image: caddy:2.8.4-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN in .env}
+      ADMS_DOMAIN: ${ADMS_DOMAIN:?set ADMS_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [edge]
+    depends_on:
+      api: { condition: service_healthy }
+      adms: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *logging
+
+networks:
+  edge: {}
+  data:
+    internal: true   # no internet access, no published ports
+
+volumes:
+  pgdata: {}
+  caddy_data: {}
+  caddy_config: {}

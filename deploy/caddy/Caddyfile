@@ -1,0 +1,95 @@
+# Two hostnames, two jobs:
+#   APP_DOMAIN   HR dashboard and application API (browser sessions)
+#   ADMS_DOMAIN  device protocol only (/iclock/*), no browser routes at all
+# Caddy obtains and renews certificates for both automatically.
+#
+# Upstream addresses can be overridden for local testing; in Docker the
+# defaults point at the Compose service names.
+
+{
+	email {$ACME_EMAIL}
+	servers {
+		# Only Caddy's own view of the client address is forwarded upstream.
+		trusted_proxies static private_ranges
+	}
+}
+
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+{$APP_DOMAIN} {
+	import security_headers
+	encode zstd gzip
+
+	handle /api/* {
+		request_body {
+			max_size 6MB
+		}
+		reverse_proxy {$API_UPSTREAM:api:8080}
+	}
+	handle /healthz {
+		respond 404
+	}
+	handle {
+		reverse_proxy {$FRONTEND_UPSTREAM:frontend:3000}
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
+
+{$ADMS_DOMAIN} {
+	import security_headers
+
+	@iclock path /iclock/*
+	handle @iclock {
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy {$ADMS_UPSTREAM:adms:8081} {
+			transport http {
+				read_timeout 60s
+				write_timeout 60s
+			}
+		}
+	}
+	handle {
+		respond "not found" 404
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
+
+# ---------------------------------------------------------------------------
+# PLAIN-HTTP DEVICE LISTENER — DISABLED BY DEFAULT
+#
+# Some MB10-VL firmware builds cannot use HTTPS for ADMS. Enabling the block
+# below sends attendance records (employee IDs and punch times) across the
+# internet unencrypted. Read docs/SECURITY.md first. The recommended options
+# are an on-site relay or a VPN instead. If you accept the risk, uncomment,
+# set ADMS_HTTP_PORT, open that port in the firewall, and restrict it with
+# the device's allowed networks on the Devices page.
+#
+# :{$ADMS_HTTP_PORT:8088} {
+# 	@iclock path /iclock/*
+# 	handle @iclock {
+# 		request_body {
+# 			max_size 2MB
+# 		}
+# 		reverse_proxy {$ADMS_UPSTREAM:adms:8081}
+# 	}
+# 	handle {
+# 		respond "not found" 404
+# 	}
+# }
